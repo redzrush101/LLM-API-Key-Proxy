@@ -656,6 +656,7 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
 
         # Apply thinking mode configuration based on reasoning_effort
         payload = self._apply_thinking_config(payload, model_name, full_kwargs)
+        explicit_thinking = self._should_enable_thinking(full_kwargs)
 
         # CLI-like defaults when absent
         payload.setdefault("temperature", 1)
@@ -669,6 +670,20 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                 payload["max_new_tokens"] = payload["max_tokens"]
             else:
                 payload["max_new_tokens"] = 32000
+
+        # Enable thinking by default unless caller explicitly disables it.
+        if "enable_thinking" not in payload:
+            if explicit_thinking is not None:
+                payload["enable_thinking"] = bool(explicit_thinking)
+            else:
+                payload["enable_thinking"] = _is_truthy_env(
+                    os.getenv("IFLOW_ENABLE_THINKING_BY_DEFAULT", "true")
+                )
+
+        if "thinking" not in payload:
+            payload["thinking"] = {
+                "type": "enabled" if bool(payload["enable_thinking"]) else "disabled"
+            }
 
         model_lower = model_name.lower()
         has_enable_thinking = "enable_thinking" in payload
