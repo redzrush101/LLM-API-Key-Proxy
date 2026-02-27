@@ -9,6 +9,7 @@ import hashlib
 import json
 import time
 import os
+import re
 import httpx
 import logging
 from typing import Union, AsyncGenerator, List, Dict, Any, Optional
@@ -77,6 +78,12 @@ IFLOW_HEADER_CONVERSATION_ID = "conversation-id"
 IFLOW_HEADER_TIMESTAMP = "x-iflow-timestamp"
 IFLOW_HEADER_SIGNATURE = "x-iflow-signature"
 IFLOW_HEADER_API_KEY = "x-api-key"
+IFLOW_HEADER_TRACEPARENT = "traceparent"
+IFLOW_HEADER_X_BIZ_INFO = "x-biz-info"
+IFLOW_HEADER_EAGLEEYE_USERDATA = "EagleEye-UserData"
+IFLOW_HEADER_PRIORITY = "priority"
+
+TRACEPARENT_PATTERN = re.compile(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
 
 # =============================================================================
 # THINKING MODE CONFIGURATION
@@ -589,20 +596,78 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
     def _extract_iflow_ids(
         self, request_args: Optional[Dict[str, Any]] = None
     ) -> Dict[str, str]:
-        """Extract session/conversation IDs from request args."""
+        """Extract iFlow routing + tracing metadata from request args."""
         request_args = request_args or {}
 
+        metadata = request_args.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        extra_headers = request_args.get("extra_headers")
+        if not isinstance(extra_headers, dict):
+            extra_headers = {}
+
+        sources: List[Dict[str, Any]] = [request_args, metadata, extra_headers]
+
         def _pick(*keys: str) -> str:
-            for key in keys:
-                value = request_args.get(key)
-                if value:
-                    return str(value)
+            for source in sources:
+                for key in keys:
+                    for source_key, value in source.items():
+                        if (
+                            isinstance(source_key, str)
+                            and source_key.lower() == key.lower()
+                            and value not in (None, "")
+                        ):
+                            return str(value)
             return ""
 
+        def _generate_traceparent() -> str:
+            trace_id = uuid.uuid4().hex
+            span_id = uuid.uuid4().hex[:16]
+            return f"00-{trace_id}-{span_id}-01"
+
+        def _normalize_traceparent(raw_value: str) -> str:
+            lowered = raw_value.strip().lower()
+            if lowered and TRACEPARENT_PATTERN.match(lowered):
+                return lowered
+            return _generate_traceparent()
+
         generated_session_id = f"session-{uuid.uuid4()}"
-        session_id = _pick("session_id", "sessionId") or generated_session_id
-        conversation_id = _pick("conversation_id", "conversationId") or session_id
-        return {"session_id": session_id, "conversation_id": conversation_id}
+        session_id = (
+            _pick(
+                "session_id",
+                "sessionId",
+                "litellm_session_id",
+                "session-id",
+                "x-litellm-session-id",
+            )
+            or generated_session_id
+        )
+        conversation_id = _pick(
+            "conversation_id",
+            "conversationId",
+            "litellm_conversation_id",
+            "conversation-id",
+            "x-litellm-conversation-id",
+        ) or str(uuid.uuid4())
+        traceparent = _normalize_traceparent(
+            _pick("traceparent", IFLOW_HEADER_TRACEPARENT)
+        )
+
+        return {
+            "session_id": session_id,
+            "conversation_id": conversation_id,
+            "traceparent": traceparent,
+            "x_biz_info": _pick(
+                "iflow_x_biz_info", "x_biz_info", IFLOW_HEADER_X_BIZ_INFO
+            ),
+            "eagleeye_userdata": _pick(
+                "iflow_eagleeye_userdata",
+                "eagleeye_userdata",
+                IFLOW_HEADER_EAGLEEYE_USERDATA,
+            ),
+            "priority": _pick("iflow_priority", IFLOW_HEADER_PRIORITY),
+        }
 
     def _build_iflow_headers(
         self,
@@ -615,6 +680,7 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
         request_ids = request_ids or self._extract_iflow_ids()
         session_id = request_ids["session_id"]
         conversation_id = request_ids["conversation_id"]
+        traceparent = request_ids.get("traceparent", "")
         timestamp_ms = int(time.time() * 1000)
 
         headers = {
@@ -624,8 +690,22 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             "User-Agent": IFLOW_USER_AGENT,
             IFLOW_HEADER_SESSION_ID: session_id,
             IFLOW_HEADER_CONVERSATION_ID: conversation_id,
-            "Accept": "text/event-stream" if stream else "application/json",
+            IFLOW_HEADER_TRACEPARENT: traceparent,
+            "Accept": "*/*",
+            "Accept-Language": "*",
+            "Sec-Fetch-Mode": "cors",
+            "Accept-Encoding": "br, gzip, deflate",
         }
+
+        if request_ids.get("x_biz_info"):
+            headers[IFLOW_HEADER_X_BIZ_INFO] = request_ids["x_biz_info"]
+        if request_ids.get("eagleeye_userdata"):
+            headers[IFLOW_HEADER_EAGLEEYE_USERDATA] = request_ids[
+                "eagleeye_userdata"
+            ]
+        if request_ids.get("priority"):
+            headers[IFLOW_HEADER_PRIORITY] = request_ids["priority"]
+
         if include_signature:
             signature = self._create_iflow_signature(
                 IFLOW_USER_AGENT, session_id, timestamp_ms, api_key
