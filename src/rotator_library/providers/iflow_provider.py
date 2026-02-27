@@ -967,15 +967,10 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             # Normalize choices for final chunk - MUST set finish_reason
             normalized_choices = normalize_choices(choices, force_final=True)
             # Build usage dict, handling empty usage gracefully
-            usage_dict = {
-                "prompt_tokens": usage_data.get("prompt_tokens", 0)
-                if usage_data
-                else 0,
-                "completion_tokens": usage_data.get("completion_tokens", 0)
-                if usage_data
-                else 0,
-                "total_tokens": usage_data.get("total_tokens", 0) if usage_data else 0,
-            }
+            usage_dict = dict(usage_data) if isinstance(usage_data, dict) else {}
+            usage_dict.setdefault("prompt_tokens", 0)
+            usage_dict.setdefault("completion_tokens", 0)
+            usage_dict.setdefault("total_tokens", 0)
 
             # CRITICAL FIX: If usage is empty/all-zeros (e.g., MiniMax sends "usage": {}),
             # set placeholder non-zero values to ensure downstream processing
@@ -1005,15 +1000,10 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
 
         # Handle usage-only chunks (no choices)
         if has_usage and not choices:
-            usage_dict = {
-                "prompt_tokens": usage_data.get("prompt_tokens", 0)
-                if usage_data
-                else 0,
-                "completion_tokens": usage_data.get("completion_tokens", 0)
-                if usage_data
-                else 0,
-                "total_tokens": usage_data.get("total_tokens", 0) if usage_data else 0,
-            }
+            usage_dict = dict(usage_data) if isinstance(usage_data, dict) else {}
+            usage_dict.setdefault("prompt_tokens", 0)
+            usage_dict.setdefault("completion_tokens", 0)
+            usage_dict.setdefault("total_tokens", 0)
             yield {
                 "choices": [],
                 "model": model_id,
