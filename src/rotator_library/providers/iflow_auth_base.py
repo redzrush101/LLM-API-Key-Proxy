@@ -640,9 +640,12 @@ class IFlowAuthBase:
             raise ValueError("Access token is empty")
 
         headers = {
-            "Accept": "application/json",
+            "Accept": "*/*",
             "accessToken": access_token,
-            "User-Agent": IFLOW_CLI_USER_AGENT,
+            "User-Agent": "node",
+            "Accept-Language": "*",
+            "Sec-Fetch-Mode": "cors",
+            "Accept-Encoding": "br, gzip, deflate",
         }
 
         async with httpx.AsyncClient(timeout=30.0) as client:

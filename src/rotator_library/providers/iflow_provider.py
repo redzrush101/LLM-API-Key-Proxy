@@ -61,6 +61,8 @@ SUPPORTED_PARAMS = {
     "temperature",
     "top_p",
     "max_tokens",
+    "max_new_tokens",
+    "max_completion_tokens",
     "stream",
     "tools",
     "tool_choice",
@@ -70,6 +72,10 @@ SUPPORTED_PARAMS = {
     "stop",
     "seed",
     "response_format",
+    "thinking",
+    "enable_thinking",
+    "chat_template_kwargs",
+    "reasoning_split",
 }
 
 IFLOW_USER_AGENT = "iFlow-Cli"
@@ -84,6 +90,10 @@ IFLOW_HEADER_EAGLEEYE_USERDATA = "EagleEye-UserData"
 IFLOW_HEADER_PRIORITY = "priority"
 
 TRACEPARENT_PATTERN = re.compile(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
+
+
+def _is_truthy_env(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 # =============================================================================
 # THINKING MODE CONFIGURATION
@@ -349,6 +359,45 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             False: Disable thinking explicitly
             None: No thinking params (passthrough - don't modify payload)
         """
+        # Check explicit iFlow thinking fields first
+        direct_thinking = kwargs.get("thinking")
+        if direct_thinking is not None:
+            if isinstance(direct_thinking, dict):
+                thinking_type = str(direct_thinking.get("type", "")).lower().strip()
+                if thinking_type == "disabled":
+                    return False
+                if thinking_type == "enabled":
+                    budget = direct_thinking.get("budget_tokens")
+                    if budget is None:
+                        return True
+                    try:
+                        return int(budget) != 0
+                    except Exception:
+                        return True
+            return bool(direct_thinking)
+
+        enable_thinking = kwargs.get("enable_thinking")
+        if enable_thinking is not None:
+            if isinstance(enable_thinking, str):
+                lowered = enable_thinking.lower().strip()
+                return lowered not in ("0", "false", "off", "none", "disabled")
+            return bool(enable_thinking)
+
+        chat_template_kwargs = kwargs.get("chat_template_kwargs")
+        if isinstance(chat_template_kwargs, dict):
+            ctk_enable = chat_template_kwargs.get("enable_thinking")
+            if ctk_enable is not None:
+                if isinstance(ctk_enable, str):
+                    lowered = ctk_enable.lower().strip()
+                    return lowered not in (
+                        "0",
+                        "false",
+                        "off",
+                        "none",
+                        "disabled",
+                    )
+                return bool(ctk_enable)
+
         # Check reasoning_effort (OpenAI-style)
         reasoning_effort = kwargs.get("reasoning_effort")
         if reasoning_effort is not None:
@@ -579,6 +628,48 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
         # Apply thinking mode configuration based on reasoning_effort
         payload = self._apply_thinking_config(payload, model_name, full_kwargs)
 
+        # CLI-like defaults when absent
+        payload.setdefault("temperature", 1)
+        payload.setdefault("top_p", 0.95)
+
+        # Align token field naming with native iFlow CLI payload shape
+        if "max_new_tokens" not in payload:
+            if "max_completion_tokens" in payload:
+                payload["max_new_tokens"] = payload["max_completion_tokens"]
+            elif "max_tokens" in payload:
+                payload["max_new_tokens"] = payload["max_tokens"]
+            else:
+                payload["max_new_tokens"] = 32000
+
+        # Maintain iFlow CLI-compatible thinking defaults on every request
+        if "enable_thinking" not in payload:
+            payload["enable_thinking"] = False
+        if "thinking" not in payload:
+            payload["thinking"] = {
+                "type": "enabled" if payload["enable_thinking"] else "disabled"
+            }
+
+        model_lower = model_name.lower()
+        if (
+            model_lower.startswith("glm-")
+            or model_lower in ENABLE_THINKING_MODELS
+            or model_lower in GLM_MODELS
+            or isinstance(payload.get("chat_template_kwargs"), dict)
+        ):
+            chat_template = payload.get("chat_template_kwargs")
+            if not isinstance(chat_template, dict):
+                chat_template = {}
+            chat_template.setdefault("enable_thinking", bool(payload["enable_thinking"]))
+            if model_lower in GLM_MODELS:
+                if chat_template.get("enable_thinking"):
+                    chat_template["clear_thinking"] = False
+                else:
+                    chat_template.pop("clear_thinking", None)
+            payload["chat_template_kwargs"] = chat_template
+
+        if model_lower in REASONING_SPLIT_MODELS and "reasoning_split" not in payload:
+            payload["reasoning_split"] = bool(payload["enable_thinking"])
+
         return payload
 
     def _create_iflow_signature(
@@ -685,7 +776,6 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
 
         headers = {
             "Authorization": f"Bearer {api_key}",
-            IFLOW_HEADER_API_KEY: api_key,
             "Content-Type": "application/json",
             "User-Agent": IFLOW_USER_AGENT,
             IFLOW_HEADER_SESSION_ID: session_id,
@@ -696,6 +786,9 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             "Sec-Fetch-Mode": "cors",
             "Accept-Encoding": "br, gzip, deflate",
         }
+
+        if _is_truthy_env(os.getenv("IFLOW_SEND_X_API_KEY", "false")):
+            headers[IFLOW_HEADER_API_KEY] = api_key
 
         if request_ids.get("x_biz_info"):
             headers[IFLOW_HEADER_X_BIZ_INFO] = request_ids["x_biz_info"]
