@@ -670,15 +670,9 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             else:
                 payload["max_new_tokens"] = 32000
 
-        # Maintain iFlow CLI-compatible thinking defaults on every request
-        if "enable_thinking" not in payload:
-            payload["enable_thinking"] = False
-        if "thinking" not in payload:
-            payload["thinking"] = {
-                "type": "enabled" if payload["enable_thinking"] else "disabled"
-            }
-
         model_lower = model_name.lower()
+        has_enable_thinking = "enable_thinking" in payload
+        enable_thinking_value = bool(payload.get("enable_thinking"))
         if (
             model_lower.startswith("glm-")
             or model_lower in ENABLE_THINKING_MODELS
@@ -688,16 +682,22 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             chat_template = payload.get("chat_template_kwargs")
             if not isinstance(chat_template, dict):
                 chat_template = {}
-            chat_template.setdefault("enable_thinking", bool(payload["enable_thinking"]))
+            if has_enable_thinking:
+                chat_template.setdefault("enable_thinking", enable_thinking_value)
             if model_lower in GLM_MODELS:
-                if chat_template.get("enable_thinking"):
+                if has_enable_thinking and chat_template.get("enable_thinking"):
                     chat_template["clear_thinking"] = False
                 else:
                     chat_template.pop("clear_thinking", None)
-            payload["chat_template_kwargs"] = chat_template
+            if chat_template:
+                payload["chat_template_kwargs"] = chat_template
 
-        if model_lower in REASONING_SPLIT_MODELS and "reasoning_split" not in payload:
-            payload["reasoning_split"] = bool(payload["enable_thinking"])
+        if (
+            model_lower in REASONING_SPLIT_MODELS
+            and "reasoning_split" not in payload
+            and has_enable_thinking
+        ):
+            payload["reasoning_split"] = enable_thinking_value
 
         return payload
 
