@@ -10,9 +10,10 @@ import json
 import time
 import os
 import re
+import threading
 import httpx
 import logging
-from typing import Union, AsyncGenerator, List, Dict, Any, Optional
+from typing import Union, AsyncGenerator, List, Dict, Any, Optional, Tuple
 from .provider_interface import ProviderInterface
 from .iflow_auth_base import IFlowAuthBase
 from .provider_cache import ProviderCache
@@ -90,6 +91,9 @@ IFLOW_HEADER_EAGLEEYE_USERDATA = "EagleEye-UserData"
 IFLOW_HEADER_PRIORITY = "priority"
 
 TRACEPARENT_PATTERN = re.compile(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
+DEFAULT_IFLOW_STICKY_MODE = "auto"
+DEFAULT_IFLOW_STICKY_TTL_SECONDS = 86400
+DEFAULT_IFLOW_STICKY_MAX_ENTRIES = 10000
 
 
 def _is_truthy_env(value: str) -> bool:
@@ -146,6 +150,31 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             disk_ttl_seconds=86400,  # 24 hours on disk
             env_prefix="IFLOW_REASONING_CACHE",
         )
+
+        self._sticky_mode = os.getenv(
+            "IFLOW_STICKY_SESSION_MODE", DEFAULT_IFLOW_STICKY_MODE
+        ).strip().lower()
+        self._sticky_ttl_seconds = max(
+            60,
+            int(
+                os.getenv(
+                    "IFLOW_STICKY_SESSION_TTL_SECONDS",
+                    str(DEFAULT_IFLOW_STICKY_TTL_SECONDS),
+                )
+            ),
+        )
+        self._sticky_max_entries = max(
+            100,
+            int(
+                os.getenv(
+                    "IFLOW_STICKY_SESSION_MAX_ENTRIES",
+                    str(DEFAULT_IFLOW_STICKY_MAX_ENTRIES),
+                )
+            ),
+        )
+        self._sticky_lock = threading.Lock()
+        self._sticky_session_cache: Dict[str, Tuple[str, float]] = {}
+        self._sticky_conversation_cache: Dict[str, Tuple[str, float]] = {}
 
     def has_custom_logic(self) -> bool:
         return True
@@ -684,6 +713,112 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
             api_key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256
         ).hexdigest()
 
+    def _sticky_enabled(self) -> bool:
+        return self._sticky_mode not in {"off", "false", "0", "none", "disabled"}
+
+    def _sticky_mode_value(self) -> str:
+        mode = self._sticky_mode
+        if mode in {"conversation", "conv"}:
+            return "conversation"
+        if mode in {"client", "user"}:
+            return "client"
+        return "auto"
+
+    def _prune_sticky_cache(self, cache: Dict[str, Tuple[str, float]], now: float) -> None:
+        expired = [
+            key for key, (_, ts) in cache.items() if now - ts > self._sticky_ttl_seconds
+        ]
+        for key in expired:
+            cache.pop(key, None)
+
+        overflow = len(cache) - self._sticky_max_entries
+        if overflow > 0:
+            oldest = sorted(cache.items(), key=lambda item: item[1][1])[:overflow]
+            for key, _ in oldest:
+                cache.pop(key, None)
+
+    def _get_sticky_value(
+        self,
+        cache: Dict[str, Tuple[str, float]],
+        keys: List[str],
+        now: float,
+    ) -> Optional[str]:
+        self._prune_sticky_cache(cache, now)
+        for key in keys:
+            cached = cache.get(key)
+            if cached is None:
+                continue
+            value, _ = cached
+            cache[key] = (value, now)
+            return value
+        return None
+
+    def _set_sticky_value(
+        self,
+        cache: Dict[str, Tuple[str, float]],
+        keys: List[str],
+        value: str,
+        now: float,
+    ) -> None:
+        self._prune_sticky_cache(cache, now)
+        for key in keys:
+            cache[key] = (value, now)
+
+    def _build_sticky_keys(
+        self,
+        sources: List[Dict[str, Any]],
+        messages: Any,
+        conversation_id: str,
+    ) -> List[str]:
+        mode = self._sticky_mode_value()
+
+        def _pick_case_insensitive(*keys: str) -> str:
+            for source in sources:
+                for key in keys:
+                    for source_key, value in source.items():
+                        if (
+                            isinstance(source_key, str)
+                            and source_key.lower() == key.lower()
+                            and value not in (None, "")
+                        ):
+                            return str(value)
+            return ""
+
+        keys: List[str] = []
+        if conversation_id:
+            conv_hash = hashlib.sha256(conversation_id.encode("utf-8")).hexdigest()[:32]
+            keys.append(f"conv:{conv_hash}")
+
+        client_identifier = _pick_case_insensitive(
+            "client_id",
+            "clientId",
+            "session_key",
+            "thread_id",
+            "threadId",
+            "user",
+            "user_id",
+            "userId",
+            "x-user-id",
+            "x-client-id",
+        )
+        if client_identifier:
+            client_hash = hashlib.sha256(client_identifier.encode("utf-8")).hexdigest()[:32]
+            keys.append(f"client:{client_hash}")
+
+        if _is_truthy_env(os.getenv("IFLOW_STICKY_HISTORY_FALLBACK", "false")) and isinstance(
+            messages, list
+        ):
+            conv_sig = self._get_conversation_signature(messages)
+            if conv_sig and conv_sig != "default":
+                keys.append(f"history:{conv_sig}")
+
+        if mode == "conversation":
+            keys = [k for k in keys if k.startswith("conv:") or k.startswith("history:")]
+        elif mode == "client":
+            keys = [k for k in keys if k.startswith("client:") or k.startswith("history:")]
+
+        return list(dict.fromkeys(keys))
+
     def _extract_iflow_ids(
         self, request_args: Optional[Dict[str, Any]] = None
     ) -> Dict[str, str]:
@@ -723,24 +858,98 @@ class IFlowProvider(IFlowAuthBase, ProviderInterface):
                 return lowered
             return _generate_traceparent()
 
-        generated_session_id = f"session-{uuid.uuid4()}"
-        session_id = (
-            _pick(
-                "session_id",
-                "sessionId",
-                "litellm_session_id",
-                "session-id",
-                "x-litellm-session-id",
-            )
-            or generated_session_id
+        explicit_session_id = _pick(
+            "session_id",
+            "sessionId",
+            "litellm_session_id",
+            "session-id",
+            "x-litellm-session-id",
         )
-        conversation_id = _pick(
+        explicit_conversation_id = _pick(
             "conversation_id",
             "conversationId",
             "litellm_conversation_id",
             "conversation-id",
             "x-litellm-conversation-id",
-        ) or str(uuid.uuid4())
+        )
+
+        messages = request_args.get("messages")
+
+        conversation_id = explicit_conversation_id
+        conversation_keys = self._build_sticky_keys(
+            sources=sources,
+            messages=messages,
+            conversation_id=conversation_id,
+        )
+        if not conversation_id:
+            if self._sticky_enabled() and conversation_keys:
+                now = time.time()
+                with self._sticky_lock:
+                    cached_conversation = self._get_sticky_value(
+                        cache=self._sticky_conversation_cache,
+                        keys=conversation_keys,
+                        now=now,
+                    )
+                    if cached_conversation:
+                        conversation_id = cached_conversation
+                    else:
+                        conversation_id = str(uuid.uuid4())
+                        self._set_sticky_value(
+                            cache=self._sticky_conversation_cache,
+                            keys=conversation_keys,
+                            value=conversation_id,
+                            now=now,
+                        )
+            else:
+                conversation_id = str(uuid.uuid4())
+
+        session_keys = self._build_sticky_keys(
+            sources=sources,
+            messages=messages,
+            conversation_id=conversation_id,
+        )
+        session_id = explicit_session_id
+        if not session_id:
+            if self._sticky_enabled() and session_keys:
+                now = time.time()
+                with self._sticky_lock:
+                    cached_session = self._get_sticky_value(
+                        cache=self._sticky_session_cache,
+                        keys=session_keys,
+                        now=now,
+                    )
+                    if cached_session:
+                        session_id = cached_session
+                    else:
+                        session_id = f"session-{uuid.uuid4()}"
+                        self._set_sticky_value(
+                            cache=self._sticky_session_cache,
+                            keys=session_keys,
+                            value=session_id,
+                            now=now,
+                        )
+            else:
+                session_id = f"session-{uuid.uuid4()}"
+        elif self._sticky_enabled() and session_keys:
+            now = time.time()
+            with self._sticky_lock:
+                self._set_sticky_value(
+                    cache=self._sticky_session_cache,
+                    keys=session_keys,
+                    value=str(session_id),
+                    now=now,
+                )
+
+        if self._sticky_enabled() and conversation_keys and conversation_id:
+            now = time.time()
+            with self._sticky_lock:
+                self._set_sticky_value(
+                    cache=self._sticky_conversation_cache,
+                    keys=conversation_keys,
+                    value=str(conversation_id),
+                    now=now,
+                )
+
         traceparent = _normalize_traceparent(
             _pick("traceparent", IFLOW_HEADER_TRACEPARENT)
         )
