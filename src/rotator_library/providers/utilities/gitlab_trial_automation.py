@@ -111,6 +111,37 @@ class GitLabTrialAutomator:
         return False
 
     @staticmethod
+    def _configure_frozen_playwright_browsers_path() -> None:
+        """Ensure frozen builds can find Playwright/Patchright browser binaries.
+
+        Patchright/Playwright force ``PLAYWRIGHT_BROWSERS_PATH=0`` when running
+        from a frozen executable unless the variable is already set. In this
+        project, browser binaries are installed in the user cache via
+        ``patchright install chromium`` / ``playwright install chromium``.
+        """
+        if os.getenv("PLAYWRIGHT_BROWSERS_PATH"):
+            return
+
+        if not (getattr(sys, "frozen", False) or globals().get("__compiled__")):
+            return
+
+        candidates: List[Path] = []
+        if sys.platform == "darwin":
+            candidates.append(Path.home() / "Library" / "Caches" / "ms-playwright")
+        elif os.name == "nt":
+            local_app_data = os.getenv("LOCALAPPDATA", "").strip()
+            if local_app_data:
+                candidates.append(Path(local_app_data) / "ms-playwright")
+            candidates.append(Path.home() / "AppData" / "Local" / "ms-playwright")
+        else:
+            candidates.append(Path.home() / ".cache" / "ms-playwright")
+
+        for path in candidates:
+            if path.exists():
+                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(path)
+                return
+
+    @staticmethod
     def _has_visible_display() -> bool:
         if os.name == "nt" or sys.platform == "darwin":
             return True
@@ -529,6 +560,8 @@ class GitLabTrialAutomator:
 
     @staticmethod
     def _import_playwright() -> tuple[Any, Callable[[Any], Awaitable[None]]]:
+        GitLabTrialAutomator._configure_frozen_playwright_browsers_path()
+
         # Try patchright first — it is a drop-in replacement for Playwright
         # that patches Chrome DevTools Protocol leaks (Runtime.enable,
         # addBinding, JS injection signatures) which Arkose Labs and similar
